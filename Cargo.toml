@@ -28,7 +28,9 @@ itertools = "0.10.3"
 crossbeam = "0.8.1"
 thiserror = "1.0.31"
 rayon = "1.5.3"
-ndarray = "0.15.4"
+#ndarray = { version = "0.15.4", features = ["blas"] }
+ndarray = { version = "0.15.4" }
+nalgebra = "0.32.1"
 
 [dev-dependencies]
 proptest = "1.0.0"

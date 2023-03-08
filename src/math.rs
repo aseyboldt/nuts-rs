@@ -1,8 +1,96 @@
 use itertools::izip;
 use multiversion::multiversion;
+use nalgebra::{Matrix4xX, DVector, DVectorViewMut, Vector4, DVectorView, Dyn, Matrix, VecStorage, U4, U1, ArrayStorage, DMatrixView, Const, Dim};
+use ndarray::{Array1, linalg::general_mat_vec_mul, ArrayViewMut1, ArrayView1};
 
 #[cfg(feature = "simd_support")]
-use std::simd::{f64x4, SimdFloat, StdFloat};
+use std::simd::{f64x4, SimdFloat, StdFloat, Simd};
+
+type EigvalsTr<const K: usize> = Matrix<f64, Const<K>, Dyn, VecStorage<f64, Const<K>, Dyn>>;
+type Eigvals<const K: usize> = Matrix<f64, Dyn, Const<K>, VecStorage<f64, Dyn, Const<K>>>;
+
+type SmallVector<const K: usize> = Matrix<f64, Const<K>, U1, ArrayStorage<f64, K, 1>>;
+type Vector = Matrix<f64, Dyn, U1, VecStorage<f64, Dyn, U1>>;
+
+
+pub struct ExpLowRank<const K: usize> {
+    vecs_tr: EigvalsTr<K>,
+    vecs: Eigvals<K>,
+    log_vals: SmallVector<K>,
+    vals_m1: SmallVector<K>,
+    vals_inv_m1: SmallVector<K>,
+    diag: Vector,
+    tmp: SmallVector<K>,
+}
+
+impl<const K: usize> ExpLowRank<K> {
+    pub fn new(n: usize) -> Self {
+        let vecs_tr = EigvalsTr::from_element(n, 1.);
+        Self {
+            vecs: vecs_tr.transpose(),
+            vecs_tr,
+            log_vals: SmallVector::zeros(),
+            vals_m1: SmallVector::zeros(),
+            vals_inv_m1: SmallVector::zeros(),
+            diag: Vector::zeros(n),
+            tmp: SmallVector::zeros(),
+        }
+    }
+
+    pub fn mult(&mut self, out: &mut DVector<f64>, vector: &DVector<f64>) {
+        mult(self, out, vector);
+    }
+}
+
+
+
+//#[cfg(feature = "simd_support")]
+#[multiversion(targets("x86_64+avx+avx2+fma", "arm+neon"))]
+pub fn mult<const K: usize>(mat: &mut ExpLowRank<K>, out: &mut DVector<f64>, vector: &DVector<f64>) {
+    out.copy_from(vector);
+    mat.tmp.gemv(1., &mat.vecs_tr, &vector, 0.);
+    mat.tmp.component_mul_assign(&mat.vals_m1);
+    out.gemv(1., &mat.vecs, &mat.tmp, 1.);
+}
+
+
+pub struct Objective<'a, const K: usize> {
+    alpha: f64,
+    draws: DMatrixView<'a, f64>,
+    grads: DMatrixView<'a, f64>,
+    draws_u: Matrix<f64, Dyn, Const<K>, VecStorage<f64, Dyn, Const<K>>>,
+    grads_u: Matrix<f64, Dyn, Const<K>, VecStorage<f64, Dyn, Const<K>>>,
+}
+
+
+impl<'a, K> Objective<'a, K> {
+    fn new() {}
+}
+
+
+fn cost<'a, const K: usize>(obj: &mut Objective<'a, K>, mat: &mut ExpLowRank<K>) {
+    obj.draws_u.gemm(1., &mat.vecs, &mat.vecs, 0.);
+    obj.grads_u.gemm(1., &obj.grads, &mat.vecs, 0.);
+
+    let norm_draws: f64 = obj.draws_u
+        .column_iter()
+        .map(|col| col.norm_squared())
+        .zip(&mat.vals_inv_m1)
+        .map(|(col_norm, &scale)| col_norm * scale)
+        .sum();
+
+    let norm_grads: f64 = obj.grads_u
+        .column_iter()
+        .map(|col| col.norm_squared())
+        .zip(&mat.vals_m1)
+        .map(|(col_norm, &scale)| col_norm * scale)
+        .sum();
+
+    let reg: f64 = -obj.alpha * (mat.log_vals.sum() - mat.log_diag().sum());
+
+    norm_grads + norm_draws + reg
+}
+
 
 pub(crate) fn logaddexp(a: f64, b: f64) -> f64 {
     if a == b {

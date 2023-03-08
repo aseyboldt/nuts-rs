@@ -1,7 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use nalgebra::{DVector, U4};
+use ndarray::Array1;
 use nix::sched::{sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
-use nuts_rs::math::{axpy, axpy_out, vector_dot};
+use nuts_rs::math::{axpy, axpy_out, vector_dot, ExpLowRank};
 use nuts_rs::test_logps::NormalLogp;
 use nuts_rs::{new_sampler, sample_parallel, Chain, JitterInitFunc, SamplerArgs};
 use rayon::ThreadPoolBuilder;
@@ -114,6 +116,22 @@ fn criterion_benchmark(c: &mut Criterion) {
                 //assert_eq!(draws.len() as u64, (n_draws + settings.num_tune) * n_chains);
                 handle.join().unwrap();
                 draws
+            });
+        });
+    }
+
+    for n in [10, 12, 1000] {
+        c.bench_function(&format!("ExpLowRank_mult_{}", n), |b| {
+            let mut out = DVector::zeros(n);
+            let vector = DVector::from_element(n, 1.);
+            let mut matrix = ExpLowRank::<4>::new(n);
+            /*
+            let mut out = Array1::zeros([n]);
+            let vector = Array1::ones([n]);
+            let mut matrix = ExpLowRank::new(n);
+            */
+            b.iter(|| {
+                matrix.mult(black_box(&mut out), black_box(&vector));
             });
         });
     }
