@@ -1,7 +1,10 @@
-use itertools::izip;
+use eigenvalues::matrix_operations::MatrixOperations;
+use itertools::{izip, Itertools};
 use multiversion::multiversion;
-use nalgebra::{Matrix4xX, DVector, DVectorViewMut, Vector4, DVectorView, Dyn, Matrix, VecStorage, U4, U1, ArrayStorage, DMatrixView, Const, Dim};
+use nalgebra::{Matrix4xX, DVector, DVectorViewMut, Vector4, DVectorView, Dyn, Matrix, VecStorage, U4, U1, ArrayStorage, DMatrixView, Const, Dim, DMatrix, DVectorSlice};
 use ndarray::{Array1, linalg::general_mat_vec_mul, ArrayViewMut1, ArrayView1};
+use rand::{rngs::StdRng, SeedableRng, Rng};
+use rand_distr::{StandardNormal, Distribution};
 
 #[cfg(feature = "simd_support")]
 use std::simd::{f64x4, SimdFloat, StdFloat, Simd};
@@ -13,6 +16,7 @@ type SmallVector<const K: usize> = Matrix<f64, Const<K>, U1, ArrayStorage<f64, K
 type Vector = Matrix<f64, Dyn, U1, VecStorage<f64, Dyn, U1>>;
 
 
+#[derive(Clone)]
 pub struct ExpLowRank<const K: usize> {
     vecs_tr: EigvalsTr<K>,
     vecs: Eigvals<K>,
@@ -37,15 +41,91 @@ impl<const K: usize> ExpLowRank<K> {
         }
     }
 
+    pub fn update_random(&mut self, seed: u64) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let n = self.diag.shape().0;
+        let raw = DMatrix::from_fn(n, n, |_, _| rng.gen::<f64>());
+        let all_vecs = raw.qr().q();
+        let vecs = all_vecs.columns(0, K);
+
+        let log_vals: Vec<_> = StandardNormal.sample_iter(&mut rng).take(K).collect();
+        let log_vals = DVector::from_vec(log_vals);
+        self.update(vecs.column_iter().map(|col| col.into()), log_vals.iter().copied());
+    }
+
+    pub fn update<'a>(&mut self, vecs: impl Iterator<Item = &'a [f64]>, log_vals: impl Iterator<Item = f64>) {
+        log_vals
+            .zip_eq(self.log_vals.iter_mut())
+            .zip_eq(self.vals_m1.iter_mut())
+            .zip_eq(self.vals_inv_m1.iter_mut())
+            .for_each(|(((val, out), m1), inv_m1)| {
+                *out = val;
+                *m1 = val.exp_m1();
+                *inv_m1 = (-val).exp_m1();
+            });
+
+        vecs
+            .zip_eq(self.vecs.column_iter_mut())
+            .zip_eq(self.vecs_tr.row_iter_mut())
+            .for_each(|((vec, mut col), mut row)| {
+                col.copy_from_slice(vec);
+                row.copy_from_slice(vec);
+            });
+
+        self.diag.iter_mut()
+            .zip_eq(self.vecs.row_iter())
+            .for_each(|(diag, row)| {
+                *diag = row.component_mul(&row).tr_dot(&self.vals_m1) + 1f64;
+            });
+    }
+
     pub fn mult(&mut self, out: &mut DVector<f64>, vector: &DVector<f64>) {
         mult(self, out, vector);
     }
 }
 
 
+impl<const K: usize> MatrixOperations for ExpLowRank<K> {
+    fn matrix_vector_prod(&self, vs: DVectorView<f64>) -> DVector<f64> {
+        let mut out = vs.clone_owned();
+        let mut self_ = self.clone();
+        self_.mult(&mut out, &vs.clone_owned());
+        out
+    }
+
+    fn matrix_matrix_prod(&self, mtx: DMatrixView<f64>) -> DMatrix<f64> {
+        let mut self_ = self.clone();
+        let mtx = mtx.clone_owned();
+        let out = mtx.clone();
+        let out_cols: Vec<_> = mtx.column_iter().zip(out.column_iter()).map(|(x, out)| {
+            let mut out = out.clone_owned();
+            self_.mult(&mut out, &x.clone_owned());
+            out
+        }).collect();
+        Matrix::from_columns(&out_cols)
+    }
+
+    fn diagonal(&self) -> DVector<f64> {
+        self.diag.clone()
+    }
+
+    fn set_diagonal(&mut self, diag: &DVector<f64>) {
+        todo!()
+    }
+
+    fn ncols(&self) -> usize {
+        self.diag.shape().0
+    }
+
+    fn nrows(&self) -> usize {
+        self.diag.shape().0
+    }
+}
+
 
 //#[cfg(feature = "simd_support")]
-#[multiversion(targets("x86_64+avx+avx2+fma", "arm+neon"))]
+//#[multiversion(targets("x86_64+avx+avx2+fma", "arm+neon"))]
+#[multiversion(targets = "simd")]
 pub fn mult<const K: usize>(mat: &mut ExpLowRank<K>, out: &mut DVector<f64>, vector: &DVector<f64>) {
     out.copy_from(vector);
     mat.tmp.gemv(1., &mat.vecs_tr, &vector, 0.);
@@ -63,12 +143,12 @@ pub struct Objective<'a, const K: usize> {
 }
 
 
-impl<'a, K> Objective<'a, K> {
+impl<'a, const K: usize> Objective<'a, K> {
     fn new() {}
 }
 
 
-fn cost<'a, const K: usize>(obj: &mut Objective<'a, K>, mat: &mut ExpLowRank<K>) {
+fn cost<'a, const K: usize>(obj: &mut Objective<'a, K>, mat: &mut ExpLowRank<K>) -> f64 {
     obj.draws_u.gemm(1., &mat.vecs, &mat.vecs, 0.);
     obj.grads_u.gemm(1., &obj.grads, &mat.vecs, 0.);
 
@@ -86,8 +166,7 @@ fn cost<'a, const K: usize>(obj: &mut Objective<'a, K>, mat: &mut ExpLowRank<K>)
         .map(|(col_norm, &scale)| col_norm * scale)
         .sum();
 
-    let reg: f64 = -obj.alpha * (mat.log_vals.sum() - mat.log_diag().sum());
-
+    let reg: f64 = -obj.alpha * (mat.log_vals.sum() - mat.diag.sum());
     norm_grads + norm_draws + reg
 }
 
@@ -377,10 +456,13 @@ pub fn axpy_out(x: &[f64], y: &[f64], a: f64, out: &mut [f64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use approx::assert_ulps_eq;
+    use approx::{assert_ulps_eq, assert_relative_eq};
+    use nalgebra::{DMatrix, SquareMatrix};
     use ndarray::prelude::*;
     use pretty_assertions::assert_eq;
     use proptest::prelude::*;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rand_distr::{StandardNormal, Distribution};
 
     fn assert_approx_eq(a: f64, b: f64) {
         if a.is_nan() {
@@ -517,5 +599,35 @@ mod tests {
     fn check_neginf() {
         assert_eq!(logaddexp(std::f64::NEG_INFINITY, 2.), 2.);
         assert_eq!(logaddexp(2., std::f64::NEG_INFINITY), 2.);
+    }
+
+
+    #[test]
+    fn check_low_rank_mult() {
+        const N: usize = 10;
+        const K: usize = 3;
+        let mut rng = StdRng::seed_from_u64(0);
+        let raw = DMatrix::from_fn(N, N, |_, _| rng.gen::<f64>());
+        let all_vecs = raw.qr().q();
+        let vecs = all_vecs.columns(0, K);
+
+        let mut mm: ExpLowRank<K> = ExpLowRank::new(N);
+        let log_vals: Vec<_> = StandardNormal.sample_iter(&mut rng).take(K).collect();
+        let log_vals = DVector::from_vec(log_vals);
+        let vals = log_vals.map(|x: f64| x.exp());
+        mm.update(vecs.column_iter().map(|col| col.into()), log_vals.iter().copied());
+
+        let naive_mm = vecs * Matrix::from_diagonal(&vals) * vecs.transpose() + DMatrix::identity(N, N) - vecs * vecs.transpose();
+
+        let x = DVector::from_iterator(N, StandardNormal.sample_iter(&mut rng).take(N));
+        let mut out = x.clone();
+        mm.mult(&mut out, &x);
+        out.iter().zip_eq((&naive_mm * x).iter()).for_each(|(x, y)| {
+            assert_relative_eq!(x, y, max_relative = 1e-8);
+        });
+
+        mm.diag.iter().zip_eq(naive_mm.diagonal().iter()).for_each(|(x, y)| {
+            assert_relative_eq!(x, y, max_relative = 1e-8);
+        });
     }
 }

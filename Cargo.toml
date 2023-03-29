@@ -31,6 +31,8 @@ rayon = "1.5.3"
 #ndarray = { version = "0.15.4", features = ["blas"] }
 ndarray = { version = "0.15.4" }
 nalgebra = "0.32.1"
+#eigenvalues = "0.4.0"
+eigenvalues = { path = "../eigenvalues" }
 
 [dev-dependencies]
 proptest = "1.0.0"

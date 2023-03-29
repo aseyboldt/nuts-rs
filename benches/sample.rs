@@ -1,5 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use nalgebra::{DVector, U4};
+use eigenvalues::{SpectrumTarget, Davidson};
+use nalgebra::{DVector, U4, DMatrix};
 use ndarray::Array1;
 use nix::sched::{sched_setaffinity, CpuSet};
 use nix::unistd::Pid;
@@ -120,7 +121,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         });
     }
 
-    for n in [10, 12, 1000] {
+    for n in [10, 12, 16, 32, 64, 1000] {
         c.bench_function(&format!("ExpLowRank_mult_{}", n), |b| {
             let mut out = DVector::zeros(n);
             let vector = DVector::from_element(n, 1.);
@@ -132,6 +133,31 @@ fn criterion_benchmark(c: &mut Criterion) {
             */
             b.iter(|| {
                 matrix.mult(black_box(&mut out), black_box(&vector));
+            });
+        });
+        c.bench_function(&format!("ExpLowRank_full_mult_{}", n), |b| {
+            let vector = DVector::from_element(n, 1.);
+            let matrix = DMatrix::identity(n, n);
+            let mut out = vector.clone();
+            /*
+            let mut out = Array1::zeros([n]);
+            let vector = Array1::ones([n]);
+            let mut matrix = ExpLowRank::new(n);
+            */
+            b.iter(|| {
+                black_box(&matrix).mul_to(black_box(&vector), &mut out);
+            });
+        });
+
+        c.bench_function(&format!("ExpLowRank_eigvals_{}", n), |b| {
+            let mut mm: ExpLowRank<8> = ExpLowRank::new(n);
+            mm.update_random(0);
+            b.iter(|| {
+                let mm = black_box(&mm).clone();
+                let target = SpectrumTarget::Highest;
+                let tolerance = 1e-8;
+                let eig = Davidson::new(mm, 4, eigenvalues::DavidsonCorrection::DPR, target, tolerance);
+                eig
             });
         });
     }
